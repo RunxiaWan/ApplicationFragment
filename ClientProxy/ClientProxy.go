@@ -42,10 +42,27 @@ func (this ClientProxy) SRVFAIL(w dns.ResponseWriter, req *dns.Msg) {
 }
 
 func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
+	// if we don't have EDNS0 in the packet, add it now
+	// TODO: in principle we should check packet size here, since we have made it bigger,
+	//       but for this demo code we will just rely on most queries being really small
+	proxy_req := *request
+	opt := proxy_req.IsEdns0()
+	var client_buf_size uint16
+	if opt == nil {
+		_D("%s QID:%d adding EDNS0 to packet", w.RemoteAddr(), request.Id)
+		proxy_req.SetEdns0(65535, false)
+		client_buf_size = 512
+	} else {
+		client_buf_size = opt.UDPSize()
+	}
+
+	// add our custom EDNS0 option
+
 	// create a connection to the server
 	// XXX: for now we will only handle UDP - this will break in unpredictable ways in production!
 	conn, err := dns.DialTimeout("udp", this.SERVERS[rand.Intn(len(this.SERVERS))], this.timeout)
 	if err != nil {
+		_D("%s QID:%d error setting up UDP socket: %s", w.RemoteAddr(), request.Id, err)
 		this.SRVFAIL(w, request)
 		return
 	}
@@ -56,7 +73,7 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	conn.SetWriteDeadline(time.Now().Add(this.timeout))
 
 	// send our query
-	err = conn.WriteMsg(request)
+	err = conn.WriteMsg(&proxy_req)
 	if err != nil {
 		_D("%s QID:%d error writing message", w.RemoteAddr(), request.Id)
 		this.SRVFAIL(w, request)
@@ -65,22 +82,24 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 
 	// wait for our reply
 	for {
-	    response, err := conn.ReadMsg()
-	    // some sort of error reading reply
-	    if err != nil {
-		_D("%s QID:%d error reading message: %s", w.RemoteAddr(), request.Id, err)
-		this.SRVFAIL(w, request)
-		return
-	    }
-	    // got a response, life is good
-	    if response.Id == request.Id {
-		_D("%s QID:%d got reply", w.RemoteAddr(), request.Id)
-                w.WriteMsg(response)
-		break
-	    }
-	    // got a response, but it was for a different QID... ignore
-	    _D("%s QID:%d ignoring reply to wrong QID:%d", w.RemoteAddr(), request.Id, response.Id)
+		// TODO: verify that we are checking source/dest ports in conn.ReadMsg()
+		response, err := conn.ReadMsg()
+		// some sort of error reading reply
+		if err != nil {
+			_D("%s QID:%d error reading message: %s", w.RemoteAddr(), request.Id, err)
+			this.SRVFAIL(w, request)
+			return
+		}
+		// got a response, life is good
+		if response.Id == request.Id {
+			_D("%s QID:%d got reply", w.RemoteAddr(), request.Id)
+			w.WriteMsg(response)
+			break
+		}
+		// got a response, but it was for a different QID... ignore
+		_D("%s QID:%d ignoring reply to wrong QID:%d", w.RemoteAddr(), request.Id, response.Id)
 	}
+	client_buf_size = client_buf_size // XXX: get rid of unused variable warning...
 }
 
 func main() {
