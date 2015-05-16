@@ -2,7 +2,7 @@
 package main
 
 import (
-	"/miekg/dns-master"
+	"github.com/miekg/dns"
 	"flag"
 	"log"
 	"math/rand"
@@ -12,6 +12,17 @@ import (
 	"time"
 )
 
+// flag whether we want to emit debug output
+var DEBUG bool = false
+
+// called for debug output
+func _D(fmt string, v ...interface{}) {
+	if DEBUG {
+		log.Printf(fmt, v...)
+	}
+}
+
+// this structure will be used by the dns.ListenAndServe() method
 type ClientProxy struct {
 	ACCESS      []*net.IPNet
 	SERVERS     []string
@@ -23,11 +34,6 @@ type ClientProxy struct {
 	timeout     time.Duration
 }
 
-func _D(fmt string, v ...interface{}) {
-	if DEBUG {
-		log.Printf(fmt, v...)
-	}
-}
 func (this ClientProxy) refused(w dns.ResponseWriter, req *dns.Msg) {
 	m := new(dns.Msg)
 	for _, r := range req.Extra {
@@ -38,6 +44,7 @@ func (this ClientProxy) refused(w dns.ResponseWriter, req *dns.Msg) {
 	m.SetRcode(req, dns.RcodeRefused)
 	w.WriteMsg(m)
 }
+
 func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	c := new(dns.Client)
 	c.ReadTimeout = this.timeout
@@ -50,8 +57,6 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		log.Printf("%s error: %s", w.RemoteAddr(), err)
 	}
 }
-
-var DEBUG bool
 
 func main() {
 
