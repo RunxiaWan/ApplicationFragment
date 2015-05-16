@@ -34,17 +34,6 @@ type ClientProxy struct {
 	timeout     time.Duration
 }
 
-func (this ClientProxy) refused(w dns.ResponseWriter, req *dns.Msg) {
-	m := new(dns.Msg)
-	for _, r := range req.Extra {
-		if r.Header().Rrtype == dns.TypeOPT {
-			m.SetEdns0(4096, r.(*dns.OPT).Do())
-		}
-	}
-	m.SetRcode(req, dns.RcodeRefused)
-	w.WriteMsg(m)
-}
-
 func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	c := new(dns.Client)
 	c.ReadTimeout = this.timeout
@@ -53,7 +42,6 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		_D("%s: request took %s", w.RemoteAddr(), rtt)
 		w.WriteMsg(response)
 	} else {
-		this.refused(w, request)
 		log.Printf("%s error: %s", w.RemoteAddr(), err)
 	}
 }
