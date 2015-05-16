@@ -74,6 +74,7 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	defer conn.Close()
 
 	// set our timeouts
+	// TODO: we need to insure that our timeouts work like we expect
 	conn.SetReadDeadline(time.Now().Add(this.timeout))
 	conn.SetWriteDeadline(time.Now().Add(this.timeout))
 
