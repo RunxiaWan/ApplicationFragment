@@ -15,33 +15,34 @@ func packUint16(i uint16) (byte, byte) {
         return byte(i >> 8), byte(i)
 }
 
-//add by RunxiaWan application fragmentation's
-type EDNS0_Af struct {
-	Code    uint16
-	SeqNO   uint8
-	TotalNo uint8
+// custom EDNS0 option
+const (
+	EDNS0FRAG = dns.EDNS0LOCALSTART
+)
+
+type EDNS0_FRAG struct {
+	Code      uint16	// Always EDNS0FRAG
+	NumFrag   uint8		// Total number of fragments to expect
+	ThisFrag  uint8		// Sequence number of this fragment (0 to NumFrag-1)
 }
 
-func (e *EDNS0_Af) Option() uint16 { return e.Code }
-func (e *EDNS0_Af) String() string {
-	return strconv.FormatInt(int64(e.Code), 10) + " SeqNo:" + strconv.FormatInt(int64(e.SeqNO), 10) + " TotalNo:" + strconv.FormatInt(int64(e.TotalNo), 10)
+func (e *EDNS0_FRAG) Option() uint16 { return EDNS0FRAG }
+func (e *EDNS0_FRAG) String() string {
+	return strconv.FormatInt(int64(e.Option()), 10) + " " + strconv.FormatInt(int64(e.NumFrag), 10) + " " + strconv.FormatInt(int64(e.ThisFrag), 10)
 }
 
-func (e *EDNS0_Af) unpack(b []byte) error {
-	if len(b) != 32 {
+func (e *EDNS0_FRAG) unpack(b []byte) error {
+	if len(b) != 2 {
 		return dns.ErrBuf
 	}
-	e.Code, _ = unpackUint16(b, 0)
-	e.SeqNO = b[4]
-	e.TotalNo = b[5]
+	e.NumFrag = b[0]
+	e.ThisFrag = b[1]
 	return nil
 }
 
-func (e *EDNS0_Af) pack() ([]byte, error) {
-	b := make([]byte, 6)
-	b[0], b[1] = packUint16(e.Code)
-	b[2], b[3] = packUint16(uint16(2))
-	b[4] = e.SeqNO
-	b[5] = e.TotalNo
+func (e *EDNS0_FRAG) pack() ([]byte, error) {
+	b := make([]byte, 2)
+	b[0] = e.NumFrag
+	b[1] = e.ThisFrag
 	return b, nil
 }
