@@ -34,15 +34,52 @@ type ClientProxy struct {
 	timeout     time.Duration
 }
 
+// SRVFAIL result for serious problems
+func (this ClientProxy) SRVFAIL(w dns.ResponseWriter, req *dns.Msg) {
+	m := new(dns.Msg)
+	m.SetRcode(req, dns.RcodeServerFailure)
+	w.WriteMsg(m)
+}
+
 func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
-	c := new(dns.Client)
-	c.ReadTimeout = this.timeout
-	c.WriteTimeout = this.timeout
-	if response, rtt, err := c.Exchange(request, this.SERVERS[rand.Intn(this.s_len)]); err == nil {
-		_D("%s: request took %s", w.RemoteAddr(), rtt)
-		w.WriteMsg(response)
-	} else {
-		log.Printf("%s error: %s", w.RemoteAddr(), err)
+	// create a connection to the server
+	// XXX: for now we will only handle UDP - this will break in unpredictable ways in production!
+	conn, err := dns.DialTimeout("udp", this.SERVERS[rand.Intn(len(this.SERVERS))], this.timeout)
+	if err != nil {
+		this.SRVFAIL(w, request)
+		return
+	}
+	defer conn.Close()
+
+	// set our timeouts
+	conn.SetReadDeadline(time.Now().Add(this.timeout))
+	conn.SetWriteDeadline(time.Now().Add(this.timeout))
+
+	// send our query
+	err = conn.WriteMsg(request)
+	if err != nil {
+		_D("%s QID:%d error writing message", w.RemoteAddr(), request.Id)
+		this.SRVFAIL(w, request)
+		return
+	}
+
+	// wait for our reply
+	for {
+	    response, err := conn.ReadMsg()
+	    // some sort of error reading reply
+	    if err != nil {
+		_D("%s QID:%d error reading message: %s", w.RemoteAddr(), request.Id, err)
+		this.SRVFAIL(w, request)
+		return
+	    }
+	    // got a response, life is good
+	    if response.Id == request.Id {
+		_D("%s QID:%d got reply", w.RemoteAddr(), request.Id)
+                w.WriteMsg(response)
+		break
+	    }
+	    // got a response, but it was for a different QID... ignore
+	    _D("%s QID:%d ignoring reply to wrong QID:%d", w.RemoteAddr(), request.Id, response.Id)
 	}
 }
 
