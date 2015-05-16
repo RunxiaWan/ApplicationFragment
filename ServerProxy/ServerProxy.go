@@ -13,7 +13,7 @@ import (
 )
 
 // flag whether we want to emit debug output
-var DEBUG bool := false
+var DEBUG bool = false
 
 // called for debug output
 func _D(fmt string, v ...interface{}) {
