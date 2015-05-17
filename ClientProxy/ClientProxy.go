@@ -2,7 +2,7 @@
 package main
 
 import (
-	"/miekg/dns-master"
+	"github.com/miekg/dns"
 	"flag"
 	"log"
 	"math/rand"
@@ -12,6 +12,17 @@ import (
 	"time"
 )
 
+// flag whether we want to emit debug output
+var DEBUG bool = false
+
+// called for debug output
+func _D(fmt string, v ...interface{}) {
+	if DEBUG {
+		log.Printf(fmt, v...)
+	}
+}
+
+// this structure will be used by the dns.ListenAndServe() method
 type ClientProxy struct {
 	ACCESS      []*net.IPNet
 	SERVERS     []string
@@ -23,35 +34,79 @@ type ClientProxy struct {
 	timeout     time.Duration
 }
 
-func _D(fmt string, v ...interface{}) {
-	if DEBUG {
-		log.Printf(fmt, v...)
-	}
-}
-func (this ClientProxy) refused(w dns.ResponseWriter, req *dns.Msg) {
+// SRVFAIL result for serious problems
+func (this ClientProxy) SRVFAIL(w dns.ResponseWriter, req *dns.Msg) {
 	m := new(dns.Msg)
-	for _, r := range req.Extra {
-		if r.Header().Rrtype == dns.TypeOPT {
-			m.SetEdns0(4096, r.(*dns.OPT).Do())
-		}
-	}
-	m.SetRcode(req, dns.RcodeRefused)
+	m.SetRcode(req, dns.RcodeServerFailure)
 	w.WriteMsg(m)
 }
-func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
-	c := new(dns.Client)
-	c.ReadTimeout = this.timeout
-	c.WriteTimeout = this.timeout
-	if response, rtt, err := c.Exchange(request, this.SERVERS[rand.Intn(this.s_len)]); err == nil {
-		_D("%s: request took %s", w.RemoteAddr(), rtt)
-		w.WriteMsg(response)
-	} else {
-		this.refused(w, request)
-		log.Printf("%s error: %s", w.RemoteAddr(), err)
-	}
-}
 
-var DEBUG bool
+func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
+	// if we don't have EDNS0 in the packet, add it now
+	// TODO: in principle we should check packet size here, since we have made it bigger,
+	//       but for this demo code we will just rely on most queries being really small
+	proxy_req := *request
+	opt := proxy_req.IsEdns0()
+	var client_buf_size uint16
+	if opt == nil {
+		client_buf_size = 512
+		_D("%s QID:%d adding EDNS0 to packet", w.RemoteAddr(), request.Id)
+		proxy_req.SetEdns0(65535, false)
+		opt = proxy_req.IsEdns0()
+	} else {
+		client_buf_size = opt.UDPSize()
+	}
+
+	// add our custom EDNS0 option
+	local_opt := new(dns.EDNS0_LOCAL)
+	local_opt.Code = dns.EDNS0LOCALSTART
+	local_opt.Data = []byte{0, 0}
+	opt.Option = append(opt.Option, local_opt)
+
+	// create a connection to the server
+	// XXX: for now we will only handle UDP - this will break in unpredictable ways in production!
+	conn, err := dns.DialTimeout("udp", this.SERVERS[rand.Intn(len(this.SERVERS))], this.timeout)
+	if err != nil {
+		_D("%s QID:%d error setting up UDP socket: %s", w.RemoteAddr(), request.Id, err)
+		this.SRVFAIL(w, request)
+		return
+	}
+	defer conn.Close()
+
+	// set our timeouts
+	// TODO: we need to insure that our timeouts work like we expect
+	conn.SetReadDeadline(time.Now().Add(this.timeout))
+	conn.SetWriteDeadline(time.Now().Add(this.timeout))
+
+	// send our query
+	err = conn.WriteMsg(&proxy_req)
+	if err != nil {
+		_D("%s QID:%d error writing message", w.RemoteAddr(), request.Id)
+		this.SRVFAIL(w, request)
+		return
+	}
+
+	// wait for our reply
+	for {
+		// TODO: verify that we are checking source/dest ports in conn.ReadMsg()
+		response, err := conn.ReadMsg()
+		// some sort of error reading reply
+		if err != nil {
+			_D("%s QID:%d error reading message: %s", w.RemoteAddr(), request.Id, err)
+			this.SRVFAIL(w, request)
+			return
+		}
+		// got a response, life is good
+		if response.Id == request.Id {
+			_D("%s QID:%d got reply", w.RemoteAddr(), request.Id)
+			w.WriteMsg(response)
+			break
+		}
+		// got a response, but it was for a different QID... ignore
+		_D("%s QID:%d ignoring reply to wrong QID:%d", w.RemoteAddr(), request.Id, response.Id)
+	}
+	client_buf_size = client_buf_size // XXX: get rid of unused variable warning...
+}
 
 func main() {
 
