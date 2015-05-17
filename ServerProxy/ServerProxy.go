@@ -22,7 +22,7 @@ func _D(fmt string, v ...interface{}) {
 	}
 }
 
-// this structure will be used the dns.ListenAndServe() method
+// this structure will be used by the dns.ListenAndServe() method
 type ServerProxy struct {
 	ACCESS      []*net.IPNet
 	SERVERS     []string
@@ -47,6 +47,19 @@ func (this ServerProxy) refused(w dns.ResponseWriter, req *dns.Msg) {
 
 // our ServeDNS interface, which gets invoked on every DNS message
 func (this ServerProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
+	// see if we have our groovy custom EDNS0 option
+	client_supports_appfrag := false
+	opt := request.IsEdns0()
+	if opt != nil {
+		for _, e := range opt.Option {
+			if e.Option() == dns.EDNS0LOCALSTART {
+				_D("%s QID:%d found EDNS0LOCALSTART", w.RemoteAddr(), request.Id)
+				client_supports_appfrag = true
+			}
+		}
+	}
+	client_supports_appfrag = client_supports_appfrag
+
 	c := new(dns.Client)
 	c.ReadTimeout = this.timeout
 	c.WriteTimeout = this.timeout
