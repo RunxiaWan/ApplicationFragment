@@ -34,15 +34,150 @@ type ServerProxy struct {
 	timeout     time.Duration
 }
 
-func (this ServerProxy) refused(w dns.ResponseWriter, req *dns.Msg) {
-	m := new(dns.Msg)
-	for _, r := range req.Extra {
+// SRVFAIL result for serious problems
+func (this ServerProxy) SRVFAIL(w dns.ResponseWriter, req *dns.Msg) {
+        m := new(dns.Msg)
+	m.SetRcode(req, dns.RcodeServerFailure)
+	w.WriteMsg(m)
+}
+
+/*
+For fragmentation, we use a naive algorithm.
+
+We use the same header for every fragment, and include the same EDNS0
+section in every additional section.
+
+We add one RR at a time, until our fragment is larger than 512 bytes,
+then we remove the last RR so that it fits in the 512 byte size limit.
+
+If we discover that one of the fragments ends up with 0 RR in it (for
+example because a single RR is too big), then we return a single
+truncated response instead of the set of fragments.
+
+We could perhaps make the process of building fragments faster by
+bisecting the set of RR that we include in an answer. So, if we have 8
+RR we could try all, then if that is too big, 4 RR, and if that fits
+then 6 RR, until an optimal set of RR is found.
+
+We could also possibly produce a smaller set of responses by
+optimizing how we combine RR. Just taking account the various sizes is
+the same as the bin packing problem, which is NP-hard:
+
+  https://en.wikipedia.org/wiki/Bin_packing_problem
+
+While some non-optimal but reasonable heuristics exist, in the case of
+DNS we would have to use some sophisticated algorithm to also consider
+name compression.
+*/
+func frag(reply *dns.Msg) ([]dns.Msg) {
+	// create a return value
+	all_frags := []dns.Msg{}
+
+	// get each RR section and save a copy out
+	remaining_answer := make([]dns.RR, len(reply.Answer))
+	copy(remaining_answer ,reply.Answer)
+	remaining_ns := make([]dns.RR, len(reply.Ns))
+	copy(remaining_ns, reply.Ns)
+	remaining_extra := make([]dns.RR, len(reply.Extra))
+	copy(remaining_extra, reply.Extra)
+
+	// the EDNS option for later use
+	var edns0_rr dns.RR
+
+	// remove the EDNS0 option from our additional ("extra") section
+	// (we will include it separately on every fragment)
+	for ofs, r := range remaining_extra {
+		// found the EDNS option
 		if r.Header().Rrtype == dns.TypeOPT {
-			m.SetEdns0(4096, r.(*dns.OPT).Do())
+			// save the EDNS option
+			edns0_rr = r
+			// remove from the set of extra RR
+			remaining_extra = append(remaining_extra[0:ofs], remaining_extra[ofs+1:]...)
+			// in principle we should only have one EDNS0 section
+			break
 		}
 	}
-	m.SetRcode(req, dns.RcodeRefused)
-	w.WriteMsg(m)
+
+	// now build fragments
+	for {
+		// make a shallow copy of our reply packet, and prepare space for our RR
+		frag := *reply
+		frag.Answer = []dns.RR{}
+		frag.Ns = []dns.RR{}
+		frag.Extra = []dns.RR{}
+
+		// add our custom EDNS0 option (needed in every fragment)
+		edns0_rr_copy := dns.Copy(edns0_rr)
+		local_opt := new(dns.EDNS0_LOCAL)
+		local_opt.Code = dns.EDNS0LOCALSTART + 1
+		local_opt.Data = []byte{ 0, 0 }
+		edns0_rr_copy.(*dns.OPT).Option = append(edns0_rr_copy.(*dns.OPT).Option, local_opt)
+		frag.Extra = append(frag.Extra, edns0_rr_copy)
+
+		// add as many RR to the answer as we can
+		for len(remaining_answer) > 0 {
+			frag.Answer = append(frag.Answer, remaining_answer[0])
+			if frag.Len() <= 512 {
+				// if the new answer fits, then remove it from our remaining list
+				remaining_answer = remaining_answer[1:]
+			} else {
+				// otherwise we are full, remove it from our fragment and stop
+				frag.Answer = frag.Answer[0:len(frag.Answer)-1]
+				break
+			}
+		}
+		for len(remaining_ns) > 0 {
+			frag.Ns = append(frag.Ns, remaining_ns[0])
+			if frag.Len() <= 512 {
+				// if the new answer fits, then remove it from our remaining list
+				remaining_ns = remaining_ns[1:]
+			} else {
+				// otherwise we are full, remove it from our fragment and stop
+				frag.Ns = frag.Ns[0:len(frag.Ns)-1]
+				break
+			}
+		}
+		for len(remaining_extra) > 0 {
+			frag.Extra = append(frag.Extra, remaining_extra[0])
+			if frag.Len() <= 512 {
+				// if the new answer fits, then remove it from our remaining list
+				remaining_extra = remaining_extra[1:]
+			} else {
+				// otherwise we are full, remove it from our fragment and stop
+				frag.Extra = frag.Extra[0:len(frag.Extra)-1]
+				break
+			}
+		}
+
+	        // check to see if we didn't manage to add any RR
+		if (len(frag.Answer) == 0) && (len(frag.Ns) == 0) && (len(frag.Extra) == 1) {
+			// TODO: test this :)
+			// return a single truncated fragment without any RR
+			frag.MsgHdr.Truncated = true
+			frag.Extra = []dns.RR{}
+			return []dns.Msg{frag}
+		}
+
+		// add to our list of fragments
+		all_frags = append(all_frags, frag)
+		// if we have finished all remaining sections, we are done
+		if (len(remaining_answer) == 0) && (len(remaining_ns) == 0) && (len(remaining_extra) == 0) {
+			break
+		}
+	}
+
+	// fix up our fragments so they have the correct sequence and length values
+	for n, frag := range all_frags {
+		frag_edns0 := frag.IsEdns0()
+		for _, opt := range frag_edns0.Option {
+			if opt.Option() == dns.EDNS0LOCALSTART + 1 {
+				opt.(*dns.EDNS0_LOCAL).Data = []byte{ byte(len(all_frags)), byte(n) }
+			}
+		}
+	}
+
+	// return our fragments
+	return all_frags
 }
 
 // our ServeDNS interface, which gets invoked on every DNS message
@@ -51,25 +186,47 @@ func (this ServerProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	client_supports_appfrag := false
 	opt := request.IsEdns0()
 	if opt != nil {
-		for _, e := range opt.Option {
+		for ofs, e := range opt.Option {
 			if e.Option() == dns.EDNS0LOCALSTART {
 				_D("%s QID:%d found EDNS0LOCALSTART", w.RemoteAddr(), request.Id)
 				client_supports_appfrag = true
+				// go ahead and use the maximum UDP size for the local communication
+				// with our server
+				opt.SetUDPSize(65535)
+				// remove the fragmentation option
+				opt.Option = append(opt.Option[0:ofs], opt.Option[ofs+1:]...)
+				// in principle we should only have one of these options
+				break
 			}
 		}
 	}
-	client_supports_appfrag = client_supports_appfrag
 
+	// proxy the query
 	c := new(dns.Client)
 	c.ReadTimeout = this.timeout
 	c.WriteTimeout = this.timeout
-	if response, rtt, err := c.Exchange(request, this.SERVERS[rand.Intn(this.s_len)]); err == nil {
-		_D("%s: request took %s", w.RemoteAddr(), rtt)
+	response, rtt, err := c.Exchange(request, this.SERVERS[rand.Intn(this.s_len)])
+	if err != nil {
+		_D("%s QID:%d error proxying query: %s", w.RemoteAddr(), request.Id, err)
+		this.SRVFAIL(w, request)
+		return
+	}
+	_D("%s QID:%d request took %s", w.RemoteAddr(), request.Id, rtt)
+
+	// if the client does not support fragmentation, we just send the response back and finish
+	if ! client_supports_appfrag {
+		_D("%s QID:%d sending raw response to client", w.RemoteAddr(), request.Id)
 		w.WriteMsg(response)
-	} else {
-		// TODO: we should be careful and return the correct error from the server
-		this.refused(w, request)
-		log.Printf("%s error: %s", w.RemoteAddr(), err)
+		return
+	}
+
+	// otherwise lets get our fragments
+	all_frags := frag(response)
+
+	// if we have a single fragment, we don't need to fragment and can just send the original response
+	for n, frag := range(all_frags) {
+		_D("%s QID:%d sending fragment %d", w.RemoteAddr(), request.Id, n)
+		w.WriteMsg(&frag)
 	}
 }
 
@@ -83,6 +240,7 @@ func main() {
 		max_entries     int64
 		expire_interval int64
 	)
+
 	flag.StringVar(&S_SERVERS, "proxy", "127.0.0.1:53", "we proxy requests to those servers")
 	flag.StringVar(&S_LISTEN, "listen", "[::]:8000", "listen on (both tcp and udp)")
 	flag.StringVar(&S_ACCESS, "access", "0.0.0.0/0", "allow those networks, use 0.0.0.0/0 to allow everything")
