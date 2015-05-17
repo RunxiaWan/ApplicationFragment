@@ -49,9 +49,9 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	opt := proxy_req.IsEdns0()
 	var client_buf_size uint16
 	if opt == nil {
+		proxy_req.SetEdns0(512, false)
 		client_buf_size = 512
 		_D("%s QID:%d adding EDNS0 to packet", w.RemoteAddr(), request.Id)
-		proxy_req.SetEdns0(65535, false)
 		opt = proxy_req.IsEdns0()
 	} else {
 		client_buf_size = opt.UDPSize()
@@ -60,7 +60,6 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	// add our custom EDNS0 option
 	local_opt := new(dns.EDNS0_LOCAL)
 	local_opt.Code = dns.EDNS0LOCALSTART
-	local_opt.Data = []byte{0, 0}
 	opt.Option = append(opt.Option, local_opt)
 
 	// create a connection to the server
