@@ -149,6 +149,7 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 			return
 		}
 	        _, sequence_num := get_fragment_info(response)
+		// TODO: remove the extra EDNS0 option
 		frags[sequence_num] = *response
 	}
 
@@ -168,15 +169,26 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		}
 		rebuilt_reply.Answer = append(rebuilt_reply.Answer, frag.Answer...)
 		rebuilt_reply.Ns = append(rebuilt_reply.Ns, frag.Ns...)
-		// TODO: remove duplicate EDNS0 sections
-		rebuilt_reply.Extra = append(rebuilt_reply.Extra, frag.Extra...)
+		for _, r := range frag.Extra {
+			// remove EDNS0 present in fragments from final answer
+			if r.Header().Rrtype != dns.TypeOPT {
+				rebuilt_reply.Extra = append(rebuilt_reply.Extra, r)
+			}
+		}
+	}
+
+	// verify that we don't exceed the client buffer size
+	if rebuilt_reply.Len() > int(client_buf_size) {
+		// truncate if we need to
+		// TODO: test this
+		rebuilt_reply.MsgHdr.Truncated = true
+		rebuilt_reply.Answer = []dns.RR{}
+		rebuilt_reply.Ns = []dns.RR{}
+		rebuilt_reply.Extra = []dns.RR{}
 	}
 
 	// send our rebuilt reply
 	w.WriteMsg(&rebuilt_reply)
-
-	// TODO: truncation
-	client_buf_size = client_buf_size // XXX: get rid of unused variable warning...
 }
 
 func main() {
