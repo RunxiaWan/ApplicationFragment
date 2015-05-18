@@ -35,10 +35,48 @@ type ClientProxy struct {
 }
 
 // SRVFAIL result for serious problems
-func (this ClientProxy) SRVFAIL(w dns.ResponseWriter, req *dns.Msg) {
+func SRVFAIL(w dns.ResponseWriter, req *dns.Msg) {
 	m := new(dns.Msg)
 	m.SetRcode(req, dns.RcodeServerFailure)
 	w.WriteMsg(m)
+}
+
+// wait for a matching reponse
+func wait_for_response(w dns.ResponseWriter, conn *dns.Conn, request *dns.Msg) (response *dns.Msg) {
+	for {
+		response, err := conn.ReadMsg()
+		// some sort of error reading reply
+		if err != nil {
+			_D("%s QID:%d error reading message: %s", w.RemoteAddr(), request.Id, err)
+			SRVFAIL(w, request)
+			return nil
+		}
+		// got a response, life is good
+		if response.Id == request.Id {
+			_D("%s QID:%d got reply", w.RemoteAddr(), request.Id)
+			return response
+		}
+		// got a response, but it was for a different QID... ignore
+		_D("%s QID:%d ignoring reply to wrong QID:%d", w.RemoteAddr(), request.Id, response.Id)
+	}
+}
+
+// extract out the total fragments and sequence number from the EDNS0 informaton in a packet
+func get_fragment_info(msg *dns.Msg) (num_frags int, sequence_num int) {
+	num_frags = -1
+	sequence_num = -1
+	resp_edns0 := msg.IsEdns0()
+	if resp_edns0 != nil {
+		for _, opt := range resp_edns0.Option {
+			if opt.Option() == dns.EDNS0LOCALSTART + 1 {
+				num_frags = int(opt.(*dns.EDNS0_LOCAL).Data[0])
+				sequence_num = int(opt.(*dns.EDNS0_LOCAL).Data[1])
+				// we only expect this option to be here once
+				break
+			}
+		}
+	}
+	return num_frags, sequence_num
 }
 
 func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
@@ -67,7 +105,7 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	conn, err := dns.DialTimeout("udp", this.SERVERS[rand.Intn(len(this.SERVERS))], this.timeout)
 	if err != nil {
 		_D("%s QID:%d error setting up UDP socket: %s", w.RemoteAddr(), request.Id, err)
-		this.SRVFAIL(w, request)
+		SRVFAIL(w, request)
 		return
 	}
 	defer conn.Close()
@@ -80,30 +118,64 @@ func (this ClientProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	// send our query
 	err = conn.WriteMsg(&proxy_req)
 	if err != nil {
-		_D("%s QID:%d error writing message", w.RemoteAddr(), request.Id)
-		this.SRVFAIL(w, request)
+		_D("%s QID:%d error writing message: %s", w.RemoteAddr(), request.Id, err)
+		SRVFAIL(w, request)
 		return
 	}
 
 	// wait for our reply
-	for {
-		// TODO: verify that we are checking source/dest ports in conn.ReadMsg()
-		response, err := conn.ReadMsg()
-		// some sort of error reading reply
-		if err != nil {
-			_D("%s QID:%d error reading message: %s", w.RemoteAddr(), request.Id, err)
-			this.SRVFAIL(w, request)
+	response := wait_for_response(w, conn, request)
+	if response == nil {
+		return
+	}
+
+	// get fragment information from first response (if any)
+	num_frags, sequence_num := get_fragment_info(response)
+
+	// if we did not have a fragmented response, send it to the client
+	if num_frags == -1 {
+	    w.WriteMsg(response)
+	    return
+	}
+
+	// build a map to hold the fragments that we have received
+	frags := map[int]dns.Msg{ sequence_num: *response }
+
+	// wait for all fragments to arrive
+	// duplicates overwrite previous packet, missing packets eventually timeout
+	for len(frags) < num_frags {
+		response := wait_for_response(w, conn, request)
+		if response == nil {
 			return
 		}
-		// got a response, life is good
-		if response.Id == request.Id {
-			_D("%s QID:%d got reply", w.RemoteAddr(), request.Id)
-			w.WriteMsg(response)
-			break
-		}
-		// got a response, but it was for a different QID... ignore
-		_D("%s QID:%d ignoring reply to wrong QID:%d", w.RemoteAddr(), request.Id, response.Id)
+	        _, sequence_num := get_fragment_info(response)
+		frags[sequence_num] = *response
 	}
+
+	// rebuild our original packet
+	rebuilt_reply, ok := frags[0]
+	if !ok {
+		_D("%s QID:%d missing fragment 0", w.RemoteAddr(), request.Id)
+		SRVFAIL(w, request)
+		return
+	}
+	for n := 1; n < num_frags; n++ {
+		frag, ok := frags[n]
+		if !ok {
+			_D("%s QID:%d missing fragment %d", w.RemoteAddr(), request.Id, n)
+			SRVFAIL(w, request)
+			return
+		}
+		rebuilt_reply.Answer = append(rebuilt_reply.Answer, frag.Answer...)
+		rebuilt_reply.Ns = append(rebuilt_reply.Ns, frag.Ns...)
+		// TODO: remove duplicate EDNS0 sections
+		rebuilt_reply.Extra = append(rebuilt_reply.Extra, frag.Extra...)
+	}
+
+	// send our rebuilt reply
+	w.WriteMsg(&rebuilt_reply)
+
+	// TODO: truncation
 	client_buf_size = client_buf_size // XXX: get rid of unused variable warning...
 }
 
