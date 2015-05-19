@@ -81,8 +81,13 @@ func frag(reply *dns.Msg) ([]dns.Msg) {
 	remaining_extra := make([]dns.RR, len(reply.Extra))
 	copy(remaining_extra, reply.Extra)
 
+        // if we don't have EDNS0 in the packet, add it now
+	if reply.IsEdns0() == nil {
+		reply.SetEdns0(512, false)
+	}
+
 	// the EDNS option for later use
-	var edns0_rr dns.RR
+	var edns0_rr dns.RR = nil
 
 	// remove the EDNS0 option from our additional ("extra") section
 	// (we will include it separately on every fragment)
@@ -96,6 +101,11 @@ func frag(reply *dns.Msg) ([]dns.Msg) {
 			// in principle we should only have one EDNS0 section
 			break
 		}
+	}
+
+	if edns0_rr == nil {
+		log.Printf("Server reply missing EDNS0 option")
+		return []dns.Msg{}
 	}
 
 	// now build fragments
@@ -223,7 +233,7 @@ func (this ServerProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	// otherwise lets get our fragments
 	all_frags := frag(response)
 
-	// if we have a single fragment, we don't need to fragment and can just send the original response
+	// send our fragments
 	for n, frag := range(all_frags) {
 		_D("%s QID:%d sending fragment %d", w.RemoteAddr(), request.Id, n)
 		w.WriteMsg(&frag)
